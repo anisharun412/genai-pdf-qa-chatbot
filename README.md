@@ -15,21 +15,27 @@ The implementation will evaluate the chatbot’s ability to handle diverse queri
 
 ### DESIGN STEPS:
 
-#### STEP 1: Load and Parse PDF
-Use LangChain's DocumentLoader to extract text from a PDF document.
+#### Step 1: Indexing (The Data Preparation Phase) 
 
-#### STEP 2: Create a Vector Store
-Convert the text into vector embeddings using a language model, enabling semantic search.
+This stage happens **once** to build the knowledge base.
 
-#### STEP 3: Initialize the LangChain QA Pipeline
-Use LangChain's RetrievalQA to connect the vector store with a language model for answering questions.
+* **Action:** Your code loads the PDF, splits it into small, overlapping text **chunks**, and then uses an **Embedding Model** to convert these chunks into numerical vectors.
+* **Purpose:** To make the document searchable by *meaning* rather than just keywords. The **Vector Store (Chroma DB)** is the resulting searchable index.
 
-#### STEP 4: Handle User Queries
-Process user queries, retrieve relevant document sections, and generate responses.
+#### Step 2: Retrieval and Prompt Augmentation (The Search Phase) 
 
-#### STEP 5: Evaluate Effectiveness
-Test the chatbot with a variety of queries to assess accuracy and reliability.
+This stage happens **every time** the user asks a question.
 
+* **Action:** The user's question is also converted into a vector. The **Retriever** uses this vector to quickly find the top 7 chunks (documents) from the **Vector Store** that are most semantically similar to the question.
+* **Purpose:** To find only the most **relevant facts** from the large document and insert them directly into the LLM's prompt as **context**.
+
+
+#### Step 3: Generation (The Answering Phase)
+
+This stage uses the language model to create the final answer.
+
+* **Action:** The **ChatGroq LLM** receives the original question *plus* the retrieved context chunks. The **LCEL Chain** directs the model to answer the question *only* using the supplied context.
+* **Purpose:** To generate an accurate, conversational response **grounded** in the document's facts, minimizing the risk of the LLM "hallucinating" or making up an answer.
 
 ### PROGRAM:
 ```
@@ -38,154 +44,138 @@ Reg.No: 212224240016
 ```
 ```py
 import os
-import requests
+from dotenv import load_dotenv
 from pathlib import Path
+import shutil
+import time # Import time for the sleep function
+import uuid # Import uuid for unique directory names
+
+# --- LangChain Core Imports (LCEL/Runnables) ---
+from langchain_core.prompts import ChatPromptTemplate
+from langchain_core.output_parsers import StrOutputParser
+from langchain_core.runnables import RunnablePassthrough
+from langchain_classic.chains.combine_documents import create_stuff_documents_chain
+
+# --- Integration Imports (Where objects are instantiated) ---
 from langchain_community.document_loaders import PyPDFLoader
 from langchain_text_splitters import RecursiveCharacterTextSplitter
-from langchain_community.embeddings import HuggingFaceEmbeddings
-from langchain_community.vectorstores import FAISS
-from langchain_openai import ChatOpenAI
-from langchain.chains import RetrievalQA
-from langchain.prompts import PromptTemplate
-from langchain.callbacks.base import BaseCallbackHandler
-import logging
+from langchain_huggingface import HuggingFaceEmbeddings
+from langchain_community.vectorstores import Chroma
+from langchain_groq import ChatGroq
 
-# --- 1. CONFIGURATION AND DOWNLOAD ---
+# --- 1. SETUP AND CONFIGURATION ---
 
-# Define the specific LLM configuration provided by the user
-HF_ROUTER_URL = "https://router.huggingface.co/v1"
-HF_TOKEN = "token" # NOTE: Using the token provided by the user
-LLM_MODEL_NAME = "meta-llama/Llama-3.1-8B-Instruct"
+# Load environment variables
+load_dotenv()
 
-# Ensure the token is set as an environment variable for LangChain components
-os.environ['HF_TOKEN'] = HF_TOKEN
+PDF_PATH = "/content/metagpt.pdf"
+GROQ_MODEL = "llama-3.1-8b-instant"
 
-# Setup logging
-logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
+# Retrieve GROQ_API_KEY from environment (Colab secrets or .env file)
+groq_api_key = os.environ.get('GROQ_API_KEY')
 
-# Define the sample PDF document (Using the 'metagpt' paper for a concrete example)
-# Replace this with your actual document if needed.
-DOC_URL = "https://openreview.net/pdf?id=VtmBAGCN7o"
-DOC_NAME = "metagpt.pdf"
+if not groq_api_key:
+    print("FATAL: GROQ_API_KEY environment variable not found or is empty.")
+    print("Please ensure your GROQ_API_KEY is set in Colab secrets and linked to this notebook, or in a .env file.")
+    raise ValueError("GROQ_API_KEY is not set.") # Raise an error to stop execution clearly
 
-# Download the document
-if not Path(DOC_NAME).exists():
-    logging.info(f"Downloading {DOC_NAME}...")
-    try:
-        response = requests.get(DOC_URL)
-        response.raise_for_status() # Check for request errors
-        with open(DOC_NAME, "wb") as f:
-            f.write(response.content)
-        logging.info(f"Successfully downloaded {DOC_NAME}.")
-    except Exception as e:
-        logging.error(f"Failed to download {DOC_NAME}: {e}")
-        # Exit or handle error if download fails
-        exit()
+if not Path(PDF_PATH).exists():
+    print(f"FATAL: Document not found at '{PDF_PATH}'.")
+    print("Please place your PDF in the same directory and rename it to 'input_document.pdf'.")
+    raise FileNotFoundError(f"Document not found at '{PDF_PATH}'.")
 
-# --- 2. DATA PROCESSING (RAG Pipeline Components) ---
+# --- 2. DATA PROCESSING (INDEXING) ---
 
-# A. Document Loading
-logging.info("Loading document...")
-loader = PyPDFLoader(DOC_NAME)
+print(f"--- 🚀 Starting RAG Pipeline for {PDF_PATH} ---")
+
+# Generate a unique directory name for chroma_db to avoid persistent locks
+CHROMA_DB_PATH = f"./chroma_db_{uuid.uuid4().hex}"
+print(f"Using unique Chroma DB path: {CHROMA_DB_PATH}")
+
+# Remove existing unique chroma_db directory if it somehow exists (unlikely, but good practice)
+if os.path.exists(CHROMA_DB_PATH):
+    print(f"Clearing existing Chroma DB at {CHROMA_DB_PATH}...")
+    shutil.rmtree(CHROMA_DB_PATH)
+    time.sleep(1) # Small delay for safety
+
+# 2.1. Load PDF Document
+print("1. Loading PDF...")
+loader = PyPDFLoader(PDF_PATH)
 documents = loader.load()
 
-# B. Text Splitting
-logging.info("Splitting text into chunks...")
+# 2.2. Split Text into Chunks
+print("2. Splitting documents into chunks (size=800, overlap=100)...")
 text_splitter = RecursiveCharacterTextSplitter(
-    chunk_size=1000,
-    chunk_overlap=200,
-    length_function=len
+    chunk_size=800,  # Increased from 500
+    chunk_overlap=100 # Increased from 50 (ensures smoother overlap)
 )
 texts = text_splitter.split_documents(documents)
-logging.info(f"Created {len(texts)} chunks for indexing.")
 
-# C. Embedding Model
-# Use a local Hugging Face model for embeddings (cost-effective and fast)
-logging.info("Initializing embedding model...")
-embeddings = HuggingFaceEmbeddings(model_name="BAAI/bge-small-en-v1.5")
+# 2.3. Initialize Embedding Model
+print("3. Generating embeddings using 'BAAI/bge-base-en-v1.5'...")
+embeddings = HuggingFaceEmbeddings(model_name="BAAI/bge-base-en-v1.5")
 
-# D. Vector Store Creation (FAISS is a fast local index)
-logging.info("Creating FAISS Vector Store...")
-vectorstore = FAISS.from_documents(texts, embeddings)
-retriever = vectorstore.as_retriever(search_kwargs={"k": 4})
+# 2.4. Create Vector Store and Retriever
+print("4. Storing vectors in Chroma DB and creating retriever...")
+vectorstore = Chroma.from_documents(texts, embeddings, persist_directory=CHROMA_DB_PATH)
+retriever = vectorstore.as_retriever(search_kwargs={"k": 7})
 
-# --- 3. LLM AND RAG CHAIN SETUP ---
+# --- 3. LCEL RAG CHAIN SETUP ---
 
-# A. LLM Initialization (Connecting to HF Router)
-# LangChain uses the ChatOpenAI class to connect to OpenAI-compatible endpoints.
-logging.info(f"Initializing Chat LLM: {LLM_MODEL_NAME} via HF Router...")
-llm = ChatOpenAI(
-    openai_api_base=HF_ROUTER_URL,
-    openai_api_key=HF_TOKEN,
-    model=LLM_MODEL_NAME,
-    temperature=0.1, # Keep factual
+
+# 3.1. Initialize Groq LLM
+print(f"5. Initializing Groq LLM: {GROQ_MODEL} (Temperature=0)...")
+llm = ChatGroq(
+    temperature=0,
+    model_name=GROQ_MODEL,
+    api_key=groq_api_key # Explicitly pass the key
 )
 
-# B. Prompt Template
-# A robust prompt template guides the LLM to use the context and be honest about its sources.
-prompt_template = """
-You are a concise and accurate question-answering assistant. 
-Use the following context to answer the user's question. 
-If the answer is not in the context, clearly state that you cannot find the answer in the provided document.
+# 3.2. Define Prompt Template (The instruction for the LLM)
+prompt = ChatPromptTemplate.from_template("""
+You are a highly accurate chatbot. Use ONLY the provided context to answer the user's question.
+If the information is not in the context, you MUST state that you cannot find the answer in the document.
 
 Context: {context}
-Question: {question}
+Question: {input}
+""")
 
-Concise Answer:
-"""
-PROMPT = PromptTemplate(
-    template=prompt_template, input_variables=["context", "question"]
+# 3.3. Create the Document Combination Chain (The 'Stuff' chain)
+document_chain = create_stuff_documents_chain(llm, prompt)
+
+# 3.4. Final RAG Chain (using LCEL | operator)
+qa_chain = (
+    {"context": retriever, "input": RunnablePassthrough()}
+    | document_chain
+    | StrOutputParser() # The output parser converts the LLM's response into a string
 )
 
-# C. RetrievalQA Chain (The Chatbot)
-qa_chain = RetrievalQA.from_chain_type(
-    llm=llm,
-    chain_type="stuff", # 'Stuff' means it combines all retrieved docs into one prompt.
-    retriever=retriever,
-    chain_type_kwargs={"prompt": PROMPT},
-    return_source_documents=True # Important for evaluating accuracy/faithfulness
-)
+# --- 4. INTERACTION LOOP (THE CHATBOT) ---
 
-# --- 4. EVALUATION AND TESTING ---
+print("\n--- ✅ Chatbot Ready! Start Asking Questions about your PDF ---")
+print("   Type 'exit' to quit the application.")
+print("-" * 50)
 
-def evaluate_chatbot(query):
-    """Processes a query and prints the response and source."""
-    logging.info(f"\n--- Testing Query: {query} ---")
-    
-    # Run the chain
-    result = qa_chain.invoke({"query": query})
-    
-    # Extract results
-    answer = result['result']
-    source_docs = result['source_documents']
-    
-    print("\n🤖 Chatbot Response:")
-    print(answer)
-    print("\n📚 Source(s) Found:")
-    
-    # Print sources for verification (Evaluation)
-    if source_docs:
-        # Check if the answer is supported by the context (Faithfulness check)
-        print(f"✅ Found {len(source_docs)} supporting chunks (Faithfulness Check).")
-        print(f"Source Document: {source_docs[0].metadata['source']} (Page: {source_docs[0].metadata.get('page', 'N/A')})")
-        
-        # A manual Relevancy check is done by the user reviewing the answer vs the query.
-    else:
-        print("❌ No sources found.")
-        
-    return answer
+while True:
+    try:
+        query = input("You: ")
+        if query.lower() == "exit":
+            print("Chatbot: Bye! 👋")
+            break
 
-# Test with diverse queries derived from the document's content (MetaGPT)
-print("--- Starting Chatbot Evaluation ---")
+        print("\nChatbot: Thinking...")
 
-evaluate_chatbot("What is the core idea of the MetaGPT framework?")
-evaluate_chatbot("What are the two main phases of the MetaGPT workflow?")
-evaluate_chatbot("What is the role of the Architect in the process?")
-evaluate_chatbot("What is the capital of Mars?") # Test for refusal/hallucination
+        answer = qa_chain.invoke(query)
 
+        print(f"\nChatbot: {answer}\n")
+
+    except Exception as e:
+        print(f"\nAn error occurred: {e}")
+        break
 ```
 ### OUTPUT:
-<img width="1919" height="447" alt="image" src="https://github.com/user-attachments/assets/299986c8-aad0-4421-a086-a24751343b27" />
+
+<img width="1914" height="371" alt="image" src="https://github.com/user-attachments/assets/26f62793-f31c-43ff-8c4d-2e57007d29ad" />
 
 ### RESULT:
 Thus, a question-answering chatbot capable of processing and extracting information from a provided PDF document using LangChain was implemented and evaluated for its effectiveness by testing its responses to diverse queries derived from the document's content successfully.
