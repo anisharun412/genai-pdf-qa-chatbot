@@ -1,89 +1,191 @@
-## Design and Implementation of a Multidocument Retrieval Agent Using LlamaIndex
-## AIM:
-To design and implement a multidocument retrieval agent using LlamaIndex to extract and synthesize information from multiple research articles, and to evaluate its performance by testing it with diverse queries, analyzing its ability to deliver concise, relevant, and accurate responses.
+## Development of a PDF-Based Question-Answering Chatbot Using LangChain
 
-## PROBLEM STATEMENT:
-The challenge is to develop an agent that can efficiently retrieve and synthesize information from a large corpus of documents, ensuring that it answers queries with precision and relevance, leveraging LlamaIndex for effective retrieval and summarization.
+### AIM:
+To design and implement a question-answering chatbot capable of processing and extracting information from a provided PDF document using LangChain, and to evaluate its effectiveness by testing its responses to diverse queries derived from the document's content.
 
-## DESIGN STEPS:
-### STEP 1: Data Collection and Preprocessing
-- Gather a set of research articles or documents relevant to the topic.
-- Preprocess the data by converting the articles into a suitable format (e.g., plain text or structured format).
-- Tokenize the content and remove any irrelevant or noisy information.
+### PROBLEM STATEMENT:
 
-### STEP 2: Index Construction with LlamaIndex
-- Use LlamaIndex (formerly known as GPT Index) to create an index for the documents.
-- LlamaIndex will help build an optimized index for efficient retrieval, making it easy to query multiple documents at once.
-- Incorporate features like semantic search to improve relevance and accuracy of retrieval.
+In many cases, users need specific information from large documents without manually searching through them. A question-answering chatbot can address this problem by:
 
-### STEP 3: Query Handling and Response Generation
-- Develop the query interface where users can input questions related to the research articles.
-- Integrate the query interface with the LlamaIndex-powered retrieval system.
-- Process the retrieved documents to extract relevant information and synthesize a concise response, potentially using additional techniques like summarization.
+1. Parsing and indexing the content of a PDF document.
+2. Allowing users to ask questions in natural language.
+3. Providing concise and accurate answers based on the content of the document.
+  
+The implementation will evaluate the chatbot’s ability to handle diverse queries and deliver accurate responses.
 
-### STEP 4: Evaluation and Testing
-- Test the system with a range of diverse queries to evaluate its performance in terms of accuracy, relevance, and conciseness of responses.
-- Collect feedback and refine the system based on test results.
+### DESIGN STEPS:
 
-## PROGRAM:
+#### STEP 1: Load and Parse PDF
+Use LangChain's DocumentLoader to extract text from a PDF document.
 
+#### STEP 2: Create a Vector Store
+Convert the text into vector embeddings using a language model, enabling semantic search.
+
+#### STEP 3: Initialize the LangChain QA Pipeline
+Use LangChain's RetrievalQA to connect the vector store with a language model for answering questions.
+
+#### STEP 4: Handle User Queries
+Process user queries, retrieve relevant document sections, and generate responses.
+
+#### STEP 5: Evaluate Effectiveness
+Test the chatbot with a variety of queries to assess accuracy and reliability.
+
+
+### PROGRAM:
 ```
-from helper import get_openai_api_key
-OPENAI_API_KEY = get_openai_api_key()
-import nest_asyncio
-nest_asyncio.apply()
-urls = [
-    "https://openreview.net/forum?id=UYneFzXSJWh",
-    "https://openreview.net/forum?id=l4IHywGq6a",
-    "https://openreview.net/pdf?id=w1UbdvWH_R3",
-]
-
-papers = [
-    "fine_tuning_can_distort_pretra.pdf",
-    "data_efficient_graph_grammar_l.pdf",
-    "neural_collapse_under_mse_loss.pdf",
-]
-
-from utils import get_doc_tools
+Name: Arunsamy D
+Reg.No: 212224240016
+```
+```py
+import os
+import requests
 from pathlib import Path
+from langchain_community.document_loaders import PyPDFLoader
+from langchain_text_splitters import RecursiveCharacterTextSplitter
+from langchain_community.embeddings import HuggingFaceEmbeddings
+from langchain_community.vectorstores import FAISS
+from langchain_openai import ChatOpenAI
+from langchain.chains import RetrievalQA
+from langchain.prompts import PromptTemplate
+from langchain.callbacks.base import BaseCallbackHandler
+import logging
 
-paper_to_tools_dict = {}
-for paper in papers:
-    print(f"Getting tools for paper: {paper}")
-    vector_tool, summary_tool = get_doc_tools(paper, Path(paper).stem)
-    paper_to_tools_dict[paper] = [vector_tool, summary_tool]
+# --- 1. CONFIGURATION AND DOWNLOAD ---
 
-initial_tools = [t for paper in papers for t in paper_to_tools_dict[paper]]
+# Define the specific LLM configuration provided by the user
+HF_ROUTER_URL = "https://router.huggingface.co/v1"
+HF_TOKEN = "token" # NOTE: Using the token provided by the user
+LLM_MODEL_NAME = "meta-llama/Llama-3.1-8B-Instruct"
 
-from llama_index.llms.openai import OpenAI
-llm = OpenAI(model="gpt-3.5-turbo")
+# Ensure the token is set as an environment variable for LangChain components
+os.environ['HF_TOKEN'] = HF_TOKEN
 
-len(initial_tools)
+# Setup logging
+logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
 
-from llama_index.core.agent import FunctionCallingAgentWorker
-from llama_index.core.agent import AgentRunner
+# Define the sample PDF document (Using the 'metagpt' paper for a concrete example)
+# Replace this with your actual document if needed.
+DOC_URL = "https://openreview.net/pdf?id=VtmBAGCN7o"
+DOC_NAME = "metagpt.pdf"
 
-agent_worker = FunctionCallingAgentWorker.from_tools(
-    initial_tools, 
-    llm=llm, 
-    verbose=True
+# Download the document
+if not Path(DOC_NAME).exists():
+    logging.info(f"Downloading {DOC_NAME}...")
+    try:
+        response = requests.get(DOC_URL)
+        response.raise_for_status() # Check for request errors
+        with open(DOC_NAME, "wb") as f:
+            f.write(response.content)
+        logging.info(f"Successfully downloaded {DOC_NAME}.")
+    except Exception as e:
+        logging.error(f"Failed to download {DOC_NAME}: {e}")
+        # Exit or handle error if download fails
+        exit()
+
+# --- 2. DATA PROCESSING (RAG Pipeline Components) ---
+
+# A. Document Loading
+logging.info("Loading document...")
+loader = PyPDFLoader(DOC_NAME)
+documents = loader.load()
+
+# B. Text Splitting
+logging.info("Splitting text into chunks...")
+text_splitter = RecursiveCharacterTextSplitter(
+    chunk_size=1000,
+    chunk_overlap=200,
+    length_function=len
 )
-agent = AgentRunner(agent_worker)
+texts = text_splitter.split_documents(documents)
+logging.info(f"Created {len(texts)} chunks for indexing.")
 
-response = agent.query(
-    "Tell me about the OOD comparison in fine_tuning_can_distort_pretra, "
-    "and then tell me about the evaluation results"
+# C. Embedding Model
+# Use a local Hugging Face model for embeddings (cost-effective and fast)
+logging.info("Initializing embedding model...")
+embeddings = HuggingFaceEmbeddings(model_name="BAAI/bge-small-en-v1.5")
+
+# D. Vector Store Creation (FAISS is a fast local index)
+logging.info("Creating FAISS Vector Store...")
+vectorstore = FAISS.from_documents(texts, embeddings)
+retriever = vectorstore.as_retriever(search_kwargs={"k": 4})
+
+# --- 3. LLM AND RAG CHAIN SETUP ---
+
+# A. LLM Initialization (Connecting to HF Router)
+# LangChain uses the ChatOpenAI class to connect to OpenAI-compatible endpoints.
+logging.info(f"Initializing Chat LLM: {LLM_MODEL_NAME} via HF Router...")
+llm = ChatOpenAI(
+    openai_api_base=HF_ROUTER_URL,
+    openai_api_key=HF_TOKEN,
+    model=LLM_MODEL_NAME,
+    temperature=0.1, # Keep factual
 )
 
-response = agent.query("Give me a summary of three files")
-print(str(response))
+# B. Prompt Template
+# A robust prompt template guides the LLM to use the context and be honest about its sources.
+prompt_template = """
+You are a concise and accurate question-answering assistant. 
+Use the following context to answer the user's question. 
+If the answer is not in the context, clearly state that you cannot find the answer in the provided document.
+
+Context: {context}
+Question: {question}
+
+Concise Answer:
+"""
+PROMPT = PromptTemplate(
+    template=prompt_template, input_variables=["context", "question"]
+)
+
+# C. RetrievalQA Chain (The Chatbot)
+qa_chain = RetrievalQA.from_chain_type(
+    llm=llm,
+    chain_type="stuff", # 'Stuff' means it combines all retrieved docs into one prompt.
+    retriever=retriever,
+    chain_type_kwargs={"prompt": PROMPT},
+    return_source_documents=True # Important for evaluating accuracy/faithfulness
+)
+
+# --- 4. EVALUATION AND TESTING ---
+
+def evaluate_chatbot(query):
+    """Processes a query and prints the response and source."""
+    logging.info(f"\n--- Testing Query: {query} ---")
+    
+    # Run the chain
+    result = qa_chain.invoke({"query": query})
+    
+    # Extract results
+    answer = result['result']
+    source_docs = result['source_documents']
+    
+    print("\n🤖 Chatbot Response:")
+    print(answer)
+    print("\n📚 Source(s) Found:")
+    
+    # Print sources for verification (Evaluation)
+    if source_docs:
+        # Check if the answer is supported by the context (Faithfulness check)
+        print(f"✅ Found {len(source_docs)} supporting chunks (Faithfulness Check).")
+        print(f"Source Document: {source_docs[0].metadata['source']} (Page: {source_docs[0].metadata.get('page', 'N/A')})")
+        
+        # A manual Relevancy check is done by the user reviewing the answer vs the query.
+    else:
+        print("❌ No sources found.")
+        
+    return answer
+
+# Test with diverse queries derived from the document's content (MetaGPT)
+print("--- Starting Chatbot Evaluation ---")
+
+evaluate_chatbot("What is the core idea of the MetaGPT framework?")
+evaluate_chatbot("What are the two main phases of the MetaGPT workflow?")
+evaluate_chatbot("What is the role of the Architect in the process?")
+evaluate_chatbot("What is the capital of Mars?") # Test for refusal/hallucination
+
 ```
-## OUTPUT:
+### OUTPUT:
+<img width="1919" height="447" alt="image" src="https://github.com/user-attachments/assets/299986c8-aad0-4421-a086-a24751343b27" />
 
-<img width="1328" height="691" alt="505102214-e3ccb548-56f6-4d4e-9057-ebf2f98b9978" src="https://github.com/user-attachments/assets/63086832-15db-47b3-9eeb-bec509348a66" />
-<img width="1310" height="726" alt="505102854-a9ad8b0c-d7f7-4560-8f8a-19fc94e89019" src="https://github.com/user-attachments/assets/f24d31b2-a5bb-4cab-86f2-97d2ef932d82" />
-<img width="1320" height="755" alt="505102943-83c3ce85-0d86-4918-b9f3-4141afb29c4a" src="https://github.com/user-attachments/assets/ec1ee27c-6c04-4330-914f-6d7377a19e61" />
-
-## RESULT:
-The system successfully retrieves and synthesizes relevant information from multiple documents, providing concise and relevant answers to the user's query. Performance is evaluated based on the accuracy, relevance, and coherence of the responses.
-The system successfully retrieves and synthesizes relevant information from multiple documents, providing concise and relevant answers to the user's query. Performance is evaluated based on the accuracy, relevance, and coherence of the responses.
+### RESULT:
+Thus, a question-answering chatbot capable of processing and extracting information from a provided PDF document using LangChain was implemented and evaluated for its effectiveness by testing its responses to diverse queries derived from the document's content successfully.
